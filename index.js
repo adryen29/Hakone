@@ -294,27 +294,23 @@ async function fetchBotLogs(guild, channelId) {
 
 async function restoreFromLogs(guild) {
     // ── 1. Reconstruction de la safeList ───────────────────
-    //   On rejoue chaque embed "Ajout" / "Retrait" dans l'ordre
-    //   pour obtenir l'état final exact.
+    //   +removesafe supprime physiquement le message "Ajout"
+    //   du salon, donc seuls les messages encore présents
+    //   correspondent à des membres actuellement whitelistés.
+    //   Pas besoin de gérer un état "Retrait" : s'il est là → in, sinon → out.
     try {
         const msgs = await fetchBotLogs(guild, LOG.safe);
         for (const msg of msgs) {
             const embed = msg.embeds[0];
-            if (!embed) continue;
+            if (!embed?.title?.includes('Ajout')) continue;
 
-            // Champ présent dans les deux cas (+safe et +removesafe)
-            const field = embed.fields?.find(f =>
-                f.name === 'Membre protégé' || f.name === 'Membre retiré'
-            );
+            const field = embed.fields?.find(f => f.name === 'Membre protégé');
             if (!field) continue;
 
-            // Extrait l'ID depuis le format  "tag `(123456789)`"
             const match = field.value.match(/`\((\d+)\)`/);
             if (!match) continue;
-            const userId = match[1];
 
-            if (embed.title?.includes('Ajout'))   safeList.add(userId);
-            if (embed.title?.includes('Retrait')) safeList.delete(userId);
+            safeList.add(match[1]);
         }
         console.log(`[RESTORE] safeList : ${safeList.size} membre(s) whitelisté(s)`);
     } catch (e) {
@@ -741,15 +737,23 @@ client.on('messageCreate', async (message) => {
 
         safeList.delete(target.id);
 
-        const embed = new EmbedBuilder()
-            .setColor(0xFF4444).setTitle('🛡️ Whitelist RAID — Retrait')
-            .addFields(
-                { name: 'Membre retiré', value: `${target.user.tag} \`(${target.id})\``, inline: true },
-                { name: 'Retiré par',    value: message.author.tag, inline: true }
-            ).setTimestamp();
+        // Cherche et supprime le message "Ajout" correspondant dans le salon de log
+        try {
+            const safeCh = message.guild.channels.cache.get(LOG.safe);
+            if (safeCh?.isTextBased()) {
+                const logs = await safeCh.messages.fetch({ limit: 100 });
+                const logMsg = logs.find(m =>
+                    m.author.id === client.user.id &&
+                    m.embeds[0]?.title?.includes('Ajout') &&
+                    m.embeds[0]?.fields?.some(f => f.value.includes(`(${target.id})`))
+                );
+                if (logMsg) await logMsg.delete();
+            }
+        } catch (e) {
+            console.error('[REMOVESAFE] Suppression du log :', e.message);
+        }
 
-        message.reply({ embeds: [embed] });
-        await sendLog(message.guild, LOG.safe, embed);
+        message.reply(`✅ **${target.user.tag}** retiré de la whitelist RAID.`);
     }
 
     // ────────────────────────────────────────────────────────
