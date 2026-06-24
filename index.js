@@ -1,11 +1,29 @@
 const { Client, GatewayIntentBits } = require('discord.js');
+const http = require('http'); // <-- Ajout du module natif HTTP de Node.js
+
+// ===================================================================
+// 🌐 SERVEUR WEB FACTICE POUR RENDER
+// Ce bloc sert uniquement à ouvrir un port pour empêcher Render 
+// de couper le bot (obligatoire si hébergé en tant que "Web Service").
+// ===================================================================
+const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end('Le bot Discord est en ligne et fonctionne !');
+});
+// Render attribue automatiquement un port via la variable process.env.PORT
+const port = process.env.PORT || 10000;
+server.listen(port, () => {
+    console.log(`Faux serveur web démarré sur le port ${port} pour satisfaire Render.`);
+});
+// ===================================================================
+
 
 // Création d'une nouvelle instance du client Discord
 const client = new Client({
     intents: [
-        GatewayIntentBits.Guilds,           // Permet au bot de savoir sur quels serveurs il est
-        GatewayIntentBits.GuildMessages,    // Permet au bot de voir l'activité des messages
-        GatewayIntentBits.MessageContent    // OBLIGATOIRE pour lire le texte des messages (ex: "+ping")
+        GatewayIntentBits.Guilds,           
+        GatewayIntentBits.GuildMessages,    
+        GatewayIntentBits.MessageContent    
     ]
 });
 
@@ -22,7 +40,7 @@ client.on('messageCreate', message => {
     // Si le message est envoyé par un bot ou s'il ne commence pas par ton préfixe, on l'ignore
     if (message.author.bot || !message.content.startsWith(prefix)) return;
 
-    // CORRECTION ICI : On sépare les mots par les espaces de manière correcte (/ +/)
+    // On sépare les mots par les espaces
     const args = message.content.slice(prefix.length).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
