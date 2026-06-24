@@ -273,11 +273,104 @@ client.on('messageDelete', (message) => {
 });
 
 // ============================================================
+// 🔄 RESTAURATION DE L'ÉTAT AU DÉMARRAGE
+// Relit les salons de logs Discord pour reconstruire :
+//   • safeList      (LOG.safe    — ajouts ET retraits)
+//   • tempBanTimers (LOG.tempban — bans pas encore expirés)
+// ============================================================
+
+/**
+ * Relit les 100 derniers messages d'un salon de log du bot.
+ * Retourne les messages triés du plus ancien au plus récent.
+ */
+async function fetchBotLogs(guild, channelId) {
+    const ch = guild.channels.cache.get(channelId);
+    if (!ch?.isTextBased()) return [];
+    const messages = await ch.messages.fetch({ limit: 100 });
+    return [...messages.values()]
+        .filter(m => m.author.id === client.user.id)
+        .reverse(); // oldest → newest pour rejouer l'historique dans l'ordre
+}
+
+async function restoreFromLogs(guild) {
+    // ── 1. Reconstruction de la safeList ───────────────────
+    //   On rejoue chaque embed "Ajout" / "Retrait" dans l'ordre
+    //   pour obtenir l'état final exact.
+    try {
+        const msgs = await fetchBotLogs(guild, LOG.safe);
+        for (const msg of msgs) {
+            const embed = msg.embeds[0];
+            if (!embed) continue;
+
+            // Champ présent dans les deux cas (+safe et +removesafe)
+            const field = embed.fields?.find(f =>
+                f.name === 'Membre protégé' || f.name === 'Membre retiré'
+            );
+            if (!field) continue;
+
+            // Extrait l'ID depuis le format  "tag `(123456789)`"
+            const match = field.value.match(/`\((\d+)\)`/);
+            if (!match) continue;
+            const userId = match[1];
+
+            if (embed.title?.includes('Ajout'))   safeList.add(userId);
+            if (embed.title?.includes('Retrait')) safeList.delete(userId);
+        }
+        console.log(`[RESTORE] safeList : ${safeList.size} membre(s) whitelisté(s)`);
+    } catch (e) {
+        console.error('[RESTORE] safeList :', e.message);
+    }
+
+    // ── 2. Reconstruction des timers de tempban ─────────────
+    //   Pour chaque tempban encore actif, on recalcule le temps
+    //   restant et on replanifie le unban automatique.
+    try {
+        const msgs = await fetchBotLogs(guild, LOG.tempban);
+        for (const msg of msgs) {
+            const embed = msg.embeds[0];
+            if (!embed?.title?.includes('Temp-Ban')) continue;
+
+            const memberField   = embed.fields?.find(f => f.name === 'Membre');
+            const durationField = embed.fields?.find(f => f.name === 'Durée');
+            if (!memberField || !durationField) continue;
+
+            const userMatch = memberField.value.match(/`\((\d+)\)`/);
+            const hours     = parseFloat(durationField.value);
+            if (!userMatch || isNaN(hours)) continue;
+
+            const userId    = userMatch[1];
+            const expireAt  = msg.createdTimestamp + hours * 3_600_000;
+            const remaining = expireAt - Date.now();
+
+            // Déjà expiré ou timer déjà planifié (on garde le plus récent)
+            if (remaining <= 0) continue;
+            if (tempBanTimers.has(userId)) clearTimeout(tempBanTimers.get(userId));
+
+            tempBanTimers.set(userId, setTimeout(async () => {
+                try {
+                    await guild.bans.remove(userId, 'Expiration du tempban automatique (restauré)');
+                    console.log(`[TEMPBAN] Unban automatique restauré : ${userId}`);
+                } catch { /* déjà débanni manuellement */ }
+                tempBanTimers.delete(userId);
+            }, remaining));
+        }
+        console.log(`[RESTORE] tempBanTimers : ${tempBanTimers.size} timer(s) replanifié(s)`);
+    } catch (e) {
+        console.error('[RESTORE] tempBanTimers :', e.message);
+    }
+}
+
+// ============================================================
 // 🎮 GESTIONNAIRE DE COMMANDES
 // ============================================================
-client.once('ready', () =>
-    console.log(`[BOT] ✅ Connecté en tant que ${client.user.tag}`)
-);
+client.once('ready', async () => {
+    console.log(`[BOT] ✅ Connecté en tant que ${client.user.tag}`);
+
+    // Restaure l'état pour chaque serveur où le bot est présent
+    for (const [, guild] of client.guilds.cache) {
+        await restoreFromLogs(guild);
+    }
+});
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.guild) return;
@@ -634,6 +727,32 @@ client.on('messageCreate', async (message) => {
     }
 
     // ────────────────────────────────────────────────────────
+    // +removesafe @user
+    // ────────────────────────────────────────────────────────
+    else if (command === 'removesafe') {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator))
+            return message.reply('❌ Permission **Administrateur** requise.');
+
+        const target = message.mentions.members.first();
+        if (!target) return message.reply('❌ Usage : `+removesafe @membre`');
+
+        if (!safeList.has(target.id))
+            return message.reply(`ℹ️ **${target.user.tag}** n\'est pas dans la whitelist RAID.`);
+
+        safeList.delete(target.id);
+
+        const embed = new EmbedBuilder()
+            .setColor(0xFF4444).setTitle('🛡️ Whitelist RAID — Retrait')
+            .addFields(
+                { name: 'Membre retiré', value: `${target.user.tag} \`(${target.id})\``, inline: true },
+                { name: 'Retiré par',    value: message.author.tag, inline: true }
+            ).setTimestamp();
+
+        message.reply({ embeds: [embed] });
+        await sendLog(message.guild, LOG.safe, embed);
+    }
+
+    // ────────────────────────────────────────────────────────
     // +BACKUP
     // ────────────────────────────────────────────────────────
     else if (command === 'backup') {
@@ -822,6 +941,7 @@ client.on('messageCreate', async (message) => {
                     value : [
                         '`+DmAll <message>` — Envoie un DM à tous les membres',
                         '`+safe @user` — Ajoute à la whitelist RAID',
+                        '`+removesafe @user` — Retire de la whitelist RAID',
                         '`+BACKUP` — Sauvegarde rôles, salons & permissions sur le serveur backup',
                         '`+kill` — Éteindre le bot *(accès restreint)*',
                     ].join('\n'),
