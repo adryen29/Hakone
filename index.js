@@ -22,8 +22,8 @@ client.on('messageCreate', message => {
     // Si le message est envoyé par un bot ou s'il ne commence pas par ton préfixe, on l'ignore
     if (message.author.bot || !message.content.startsWith(prefix)) return;
 
-    // On sépare le préfixe du reste pour obtenir le nom de la commande
-    const args = message.content.slice(prefix.length).trim().split(/+/);
+    // CORRECTION ICI : On sépare les mots par les espaces de manière correcte (/ +/)
+    const args = message.content.slice(prefix.length).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
     // La commande +ping
@@ -34,6 +34,5 @@ client.on('messageCreate', message => {
     }
 });
 
-// Connexion du bot à Discord (Remplace par ton jeton secret !)
-// Sur Render, il faudra utiliser une variable d'environnement (ex: process.env.TOKEN)
+// Connexion sécurisée avec ta variable Render
 client.login(process.env.DISCORD_TOKEN);
