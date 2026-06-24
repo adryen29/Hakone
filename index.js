@@ -55,7 +55,8 @@ const LOG = {
     tempban  : '1519472967640285313',
     mute     : '1519473215746080778',
     tempmute : '1519473058102902976',
-    snipe    : '1519474678199095417',
+    allDeleted : '1519474678199095417', // 🗑️ TOUS les messages supprimés (log brut)
+    snipe      : '1519491455750508805', // 🔍 Résultats de la commande +snipe
     safe     : '1519473513042542724',
     raid     : '1519474527829229639',
 };
@@ -260,15 +261,67 @@ client.on('channelUpdate', async (oldCh, newCh) => {
 // ============================================================
 // 💬 SYSTÈME SNIPE — capture des messages supprimés
 // ============================================================
-client.on('messageDelete', (message) => {
+client.on('messageDelete', async (message) => {
+    // Ignore les messages partiels (non mis en cache par Discord)
+    if (message.partial || !message.guild) return;
+
+    const deletedAt = Date.now();
+
+    // ── 1. Log brut de TOUS les messages supprimés ──────────
+    // (bots inclus, même sans texte — on note les pièces jointes)
+    try {
+        const desc = message.content || '*(pas de contenu textuel)*';
+        const attachments = message.attachments.size > 0
+            ? `\n📎 **${message.attachments.size} pièce(s) jointe(s)** : `
+              + message.attachments.map(a => a.url).join(', ')
+            : '';
+
+        const logEmbed = new EmbedBuilder()
+            .setColor(0xFF6B6B)
+            .setTitle('🗑️ Message supprimé')
+            .setDescription(desc + attachments)
+            .addFields(
+                { name: 'Auteur',   value: message.author
+                    ? `${message.author.tag} \`(${message.author.id})\``
+                    : '*(inconnu)*', inline: true },
+                { name: 'Salon',    value: `<#${message.channel.id}>`, inline: true },
+                { name: 'Supprimé', value: `<t:${Math.floor(deletedAt / 1000)}:R>`, inline: true },
+            )
+            .setTimestamp();
+
+        await sendLog(message.guild, LOG.allDeleted, logEmbed);
+    } catch (e) {
+        console.error('[SNIPE-LOG]', e.message);
+    }
+
+    // ── 2. Stockage pour la commande +snipe ─────────────────
+    // Uniquement si l'auteur n'est pas un bot et qu'il y a du texte
     if (!message.author || message.author.bot || !message.content) return;
+
+    // Récupère les 5 messages envoyés juste avant le message supprimé
+    let context = [];
+    try {
+        const fetched = await message.channel.messages.fetch({
+            before : message.id,
+            limit  : 5,
+        });
+        context = [...fetched.values()]
+            .reverse() // du plus ancien au plus récent
+            .map(m => ({
+                content   : m.content || '*(pas de texte)*',
+                authorTag : m.author.tag,
+                authorId  : m.author.id,
+            }));
+    } catch { /* channel inaccessible ou messages non mis en cache */ }
+
     snipeStore.set(message.channel.id, {
         content     : message.content,
         authorTag   : message.author.tag,
         authorId    : message.author.id,
         channelId   : message.channel.id,
         channelName : message.channel.name,
-        deletedAt   : Date.now(),
+        deletedAt,
+        context,       // 5 messages au-dessus du message supprimé
     });
 });
 
@@ -669,14 +722,28 @@ client.on('messageCreate', async (message) => {
 
         if (!entry) return message.reply('❌ Aucun message supprimé récemment trouvé.');
 
+        // ── Construit la description avec le contexte ────────
+        // Affiche les 5 messages au-dessus puis le message supprimé mis en évidence
+        let desc = '';
+
+        if (entry.context?.length) {
+            desc += '**📜 Contexte (messages au-dessus)**\n';
+            for (const ctx of entry.context) {
+                const line = ctx.content.replace(/\n/g, ' ').slice(0, 100);
+                desc += `\`${ctx.authorTag}\` : ${line}\n`;
+            }
+            desc += '\n━━━━━━━━━━━━━━━━━━━━━━\n\n';
+        }
+
+        desc += `**🗑️ Message supprimé par \`${entry.authorTag}\`**\n${entry.content}`;
+
         const embed = new EmbedBuilder()
             .setColor(0x5865F2)
             .setTitle('🔍 Snipe')
-            .setDescription(entry.content)
-            .setAuthor({ name: entry.authorTag })
+            .setDescription(desc)
             .addFields(
-                { name: 'Salon d\'origine', value: `#${entry.channelName} \`(${entry.channelId})\``, inline: true },
-                { name: 'Supprimé',         value: `<t:${Math.floor(entry.deletedAt / 1000)}:R>`,   inline: true }
+                { name: 'Salon',    value: `<#${entry.channelId}>`, inline: true },
+                { name: 'Supprimé', value: `<t:${Math.floor(entry.deletedAt / 1000)}:R>`, inline: true }
             )
             .setTimestamp();
 
