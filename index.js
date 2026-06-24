@@ -36,4 +36,4 @@ client.on('messageCreate', message => {
 
 // Connexion du bot à Discord (Remplace par ton jeton secret !)
 // Sur Render, il faudra utiliser une variable d'environnement (ex: process.env.TOKEN)
-client.login('TON_TOKEN_DISCORD_ICI');
+client.login(process.env.DISCORD_TOKEN);
