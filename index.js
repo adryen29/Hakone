@@ -928,9 +928,15 @@ client.on('messageCreate', async (message) => {
             const roleMap = new Map();
             roleMap.set(src.roles.everyone.id, dest.roles.everyone.id);
 
+            // Discord crée toujours un nouveau rôle à la position 1 (juste au-dessus
+            // de @everyone), peu importe la position passée à roles.create(). Si on
+            // crée les rôles du plus bas au plus haut, chaque nouveau rôle finit en
+            // dessous du précédent → hiérarchie inversée à l'arrivée.
+            // Solution : on crée les rôles du PLUS HAUT au PLUS BAS, ainsi chaque
+            // nouveau rôle vient bien se placer sous les rôles déjà recréés.
             const roles = [...src.roles.cache.values()]
                 .filter(r => r.id !== src.id && !r.managed)
-                .sort((a, b) => a.position - b.position);
+                .sort((a, b) => b.position - a.position);
 
             for (const r of roles) {
                 try {
