@@ -843,24 +843,45 @@ client.on('messageCreate', async (message) => {
                 'Le bot est-il bien présent sur ce serveur ?'
             );
 
-        const status = await message.reply('⏳ Backup en cours… (peut prendre quelques secondes)');
-        const src    = message.guild;
-        let rolesOk  = 0, chOk = 0, errs = 0;
+        const status = await message.reply('⏳ Backup en cours… (suppression puis reconstruction)');
+        const src = message.guild;
+        let rolesOk = 0, chOk = 0, delOk = 0, errs = 0;
 
         try {
             // ────────────────────────────────────────────────
-            // ÉTAPE 1 — Backup des rôles
-            // On construit un roleMap : ancienId → nouvelId
-            // pour pouvoir mapper les permissions des salons.
+            // ÉTAPE 1 — Nettoyage complet du serveur de backup
+            // On supprime d'abord tous les salons puis tous les
+            // rôles pour repartir d'une ardoise vierge.
             // ────────────────────────────────────────────────
-            const roleMap = new Map();
+            await status.edit('🗑️ Nettoyage du serveur de backup en cours…');
 
-            // Le rôle @everyone a toujours le même ID que le serveur
+            // Supprime tous les salons (catégories incluses)
+            for (const [, ch] of dest.channels.cache) {
+                try { await ch.delete('Nettoyage avant backup'); delOk++; }
+                catch { errs++; }
+            }
+
+            // Supprime tous les rôles sauf @everyone et les rôles gérés (bots)
+            const rolesToDelete = [...dest.roles.cache.values()]
+                .filter(r => r.id !== dest.id && !r.managed);
+            for (const r of rolesToDelete) {
+                try { await r.delete('Nettoyage avant backup'); }
+                catch { errs++; }
+            }
+
+            // ────────────────────────────────────────────────
+            // ÉTAPE 2 — Copie des rôles du serveur principal
+            // On construit roleMap (ancienId → nouvelId) pour
+            // mapper les permissions des salons ensuite.
+            // ────────────────────────────────────────────────
+            await status.edit('👑 Copie des rôles en cours…');
+
+            const roleMap = new Map();
             roleMap.set(src.roles.everyone.id, dest.roles.everyone.id);
 
             const roles = [...src.roles.cache.values()]
-                .filter(r => r.id !== src.id)               // Exclut @everyone
-                .sort((a, b) => a.position - b.position);   // Du plus bas au plus haut
+                .filter(r => r.id !== src.id && !r.managed)
+                .sort((a, b) => a.position - b.position);
 
             for (const r of roles) {
                 try {
@@ -872,52 +893,39 @@ client.on('messageCreate', async (message) => {
                         mentionable : r.mentionable,
                         reason      : `Backup depuis "${src.name}"`,
                     });
-                    // Mappe l'ancien ID → le nouveau ID créé sur le serveur dest
                     roleMap.set(r.id, newRole.id);
                     rolesOk++;
                 } catch { errs++; }
             }
 
             // ────────────────────────────────────────────────
-            // Helper : convertit les permissionOverwrites
-            // d'un salon source vers les IDs du serveur dest.
-            //
-            // Logique :
-            //  • Si l'overwrite est pour un RÔLE  → on remplace l'ID via roleMap
-            //  • Si l'overwrite est pour un MEMBRE → on garde le même userId
-            //    (l'utilisateur peut être présent sur les deux serveurs)
-            //  • Si un rôle source n'a pas pu être créé (absent du roleMap)
-            //    → on l'ignore plutôt que de créer un overwrite orphelin
+            // Helper : mappe les permissionOverwrites source
+            // vers les IDs du serveur dest via roleMap.
+            //  • Rôle   → remplacé par le nouvel ID
+            //  • Membre → userId conservé (même sur les 2 serveurs)
+            //  • Rôle introuvable dans roleMap → ignoré (orphelin)
             // ────────────────────────────────────────────────
             function mapOverwrites(channel) {
                 return channel.permissionOverwrites.cache
                     .map(po => {
-                        let targetId;
-                        if (po.type === OverwriteType.Role) {
-                            targetId = roleMap.get(po.id); // undefined si rôle non mappé
-                        } else {
-                            targetId = po.id; // membre : on conserve l'userId
-                        }
-                        if (!targetId) return null; // rôle orphelin → on ignore
-                        return {
-                            id   : targetId,
-                            type : po.type,
-                            allow: po.allow,
-                            deny : po.deny,
-                        };
+                        const targetId = po.type === OverwriteType.Role
+                            ? roleMap.get(po.id)
+                            : po.id;
+                        if (!targetId) return null;
+                        return { id: targetId, type: po.type, allow: po.allow, deny: po.deny };
                     })
-                    .filter(Boolean); // supprime les null
+                    .filter(Boolean);
             }
 
             // ────────────────────────────────────────────────
-            // ÉTAPE 2 — Backup des catégories
-            // (en premier pour pouvoir imbriquer les salons)
+            // ÉTAPE 3 — Copie des catégories
             // ────────────────────────────────────────────────
-            const cats   = [...src.channels.cache.values()]
+            await status.edit('📁 Copie des catégories en cours…');
+
+            const catMap = new Map();
+            const cats = [...src.channels.cache.values()]
                 .filter(c => c.type === ChannelType.GuildCategory)
                 .sort((a, b) => a.position - b.position);
-
-            const catMap = new Map(); // ancienId → nouvelId
 
             for (const c of cats) {
                 try {
@@ -925,7 +933,7 @@ client.on('messageCreate', async (message) => {
                         name                : c.name,
                         type                : ChannelType.GuildCategory,
                         position            : c.position,
-                        permissionOverwrites: mapOverwrites(c), // ✅ permissions copiées
+                        permissionOverwrites: mapOverwrites(c),
                         reason              : `Backup depuis "${src.name}"`,
                     });
                     catMap.set(c.id, newCat.id);
@@ -934,8 +942,10 @@ client.on('messageCreate', async (message) => {
             }
 
             // ────────────────────────────────────────────────
-            // ÉTAPE 3 — Backup des salons (texte, vocal, etc.)
+            // ÉTAPE 4 — Copie des salons (texte, vocal, etc.)
             // ────────────────────────────────────────────────
+            await status.edit('💬 Copie des salons en cours…');
+
             const channels = [...src.channels.cache.values()]
                 .filter(c => c.type !== ChannelType.GuildCategory)
                 .sort((a, b) => a.position - b.position);
@@ -946,14 +956,10 @@ client.on('messageCreate', async (message) => {
                         name                : c.name,
                         type                : c.type,
                         position            : c.position,
-                        permissionOverwrites: mapOverwrites(c), // ✅ permissions copiées
+                        permissionOverwrites: mapOverwrites(c),
                         reason              : `Backup depuis "${src.name}"`,
                     };
-
-                    // Imbrique dans la bonne catégorie si elle a été copiée
-                    if (c.parentId && catMap.has(c.parentId))
-                        opts.parent = catMap.get(c.parentId);
-
+                    if (c.parentId && catMap.has(c.parentId)) opts.parent = catMap.get(c.parentId);
                     if (c.topic)            opts.topic            = c.topic;
                     if (c.nsfw)             opts.nsfw             = c.nsfw;
                     if (c.rateLimitPerUser) opts.rateLimitPerUser = c.rateLimitPerUser;
@@ -967,8 +973,10 @@ client.on('messageCreate', async (message) => {
 
             await status.edit(
                 `✅ Backup terminé sur **${dest.name}** !\n` +
-                `📦 **${rolesOk}** rôle(s) · **${chOk}** salon(s)/catégorie(s) créé(s) · **${errs}** erreur(s).\n` +
-                `🔐 Permissions des salons copiées et mappées vers les nouveaux rôles.`
+                `🗑️ **${delOk}** salon(s) supprimé(s) · ` +
+                `👑 **${rolesOk}** rôle(s) · ` +
+                `💬 **${chOk}** salon(s)/catégorie(s) créé(s) · ` +
+                `⚠️ **${errs}** erreur(s).`
             );
 
         } catch (err) {
