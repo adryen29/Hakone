@@ -30,9 +30,6 @@ server.listen(process.env.PORT || 10000, () =>
 // ============================================================
 const PREFIX = '+';
 
-// ⬇️ Définir SECOND_SERVER_ID dans les variables d'environnement Render
-const SECOND_SERVER_ID = process.env.SECOND_SERVER_ID || '';
-
 // IDs exemptés de la protection RAID et ayant accès à +kill
 const EXEMPT_IDS = ['1102217912569319515', '1339332485930160189'];
 const KILL_IDS   = ['1102217912569319515', '1339332485930160189'];
@@ -815,41 +812,61 @@ client.on('messageCreate', async (message) => {
     }
 
     // ────────────────────────────────────────────────────────
-    // +BACKUP
+    // +backup from:<ID source> to:<ID destination>
     // ────────────────────────────────────────────────────────
     else if (command === 'backup') {
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator))
             return message.reply('❌ Permission **Administrateur** requise.');
 
-        if (!SECOND_SERVER_ID)
+        // ── Parsing des arguments from:/to: (insensible à l'ordre/la casse) ──
+        let fromId = null, toId = null;
+        for (const arg of args) {
+            const fromMatch = arg.match(/^from:(\d+)$/i);
+            const toMatch   = arg.match(/^to:(\d+)$/i);
+            if (fromMatch) fromId = fromMatch[1];
+            if (toMatch)   toId   = toMatch[1];
+        }
+
+        if (!fromId || !toId)
             return message.reply(
-                '❌ Commande échouée : la variable d\'environnement `SECOND_SERVER_ID` ' +
-                'n\'est pas définie dans Render.'
+                '❌ Usage : `+backup from:<ID serveur source> to:<ID serveur destination>`'
             );
 
-        const dest = client.guilds.cache.get(SECOND_SERVER_ID);
+        if (fromId === toId)
+            return message.reply(
+                '❌ Le serveur source et le serveur de destination ne peuvent pas être identiques !'
+            );
+
+        const src = client.guilds.cache.get(fromId);
+        if (!src)
+            return message.reply(
+                `❌ Serveur source introuvable (\`${fromId}\`). Le bot est-il bien présent sur ce serveur ?`
+            );
+
+        const dest = client.guilds.cache.get(toId);
         if (!dest)
             return message.reply(
-                '❌ Commande échouée : serveur de backup introuvable. ' +
-                'Le bot est-il bien présent sur ce serveur ?'
+                `❌ Serveur de destination introuvable (\`${toId}\`). Le bot est-il bien présent sur ce serveur ?`
             );
 
-        // ⚠️ GARDE ANTI-MÊME-SERVEUR
-        // Si SECOND_SERVER_ID pointe vers le serveur source, le backup
-        // supprimerait le salon où la commande a été tapée → crash garanti.
-        if (dest.id === message.guild.id)
-            return message.reply(
-                '❌ Le serveur de backup ne peut pas être le même que le serveur source !\n' +
-                'Vérifie la variable `SECOND_SERVER_ID` dans Render.'
-            );
+        // ── Vérification que l'auteur est bien Administrateur sur LES DEUX serveurs ──
+        // (la vérification au-dessus ne portait que sur le serveur où la commande est tapée,
+        //  qui peut être un troisième serveur "panel" différent de from/to)
+        const srcMember = await src.members.fetch(message.author.id).catch(() => null);
+        if (!srcMember || !srcMember.permissions.has(PermissionFlagsBits.Administrator))
+            return message.reply('❌ Tu dois être **Administrateur** sur le serveur source.');
 
-        const src = message.guild;
+        const destMember = await dest.members.fetch(message.author.id).catch(() => null);
+        if (!destMember || !destMember.permissions.has(PermissionFlagsBits.Administrator))
+            return message.reply('❌ Tu dois être **Administrateur** sur le serveur de destination.');
 
         // On mémorise la référence du salon SOURCE avant toute opération.
         // status.edit() peut échouer si le canal est retiré du cache pendant
         // des suppressions massives → safeEdit() bascule sur channel.send().
         const replyChannel = message.channel;
-        let status = await message.reply('⏳ Backup en cours… (suppression puis reconstruction)');
+        let status = await message.reply(
+            `⏳ Backup en cours… **${src.name}** → **${dest.name}** (suppression puis reconstruction)`
+        );
 
         /**
          * Édite le message de statut de façon sécurisée.
@@ -998,7 +1015,7 @@ client.on('messageCreate', async (message) => {
             }
 
             await safeEdit(
-                `✅ Backup terminé sur **${dest.name}** !\n` +
+                `✅ Backup terminé : **${src.name}** → **${dest.name}** !\n` +
                 `🗑️ **${delOk}** salon(s) supprimé(s) · ` +
                 `👑 **${rolesOk}** rôle(s) · ` +
                 `💬 **${chOk}** salon(s)/catégorie(s) créé(s) · ` +
@@ -1008,7 +1025,7 @@ client.on('messageCreate', async (message) => {
         } catch (err) {
             console.error('[BACKUP]', err);
             // safeEdit ici aussi pour éviter un second crash si le canal est mort
-            await safeEdit('❌ Erreur critique lors du backup. Vérifie les permissions du bot sur le serveur cible.');
+            await safeEdit('❌ Erreur critique lors du backup. Vérifie les permissions du bot sur les deux serveurs.');
         }
     }
 
@@ -1048,7 +1065,7 @@ client.on('messageCreate', async (message) => {
                         '`+DmAll <message>` — Envoie un DM à tous les membres',
                         '`+safe @user` — Ajoute à la whitelist RAID',
                         '`+removesafe @user` — Retire de la whitelist RAID',
-                        '`+BACKUP` — Sauvegarde rôles, salons & permissions sur le serveur backup',
+                        '`+backup from:<ID> to:<ID>` — Sauvegarde rôles, salons & permissions d\'un serveur vers un autre',
                         '`+kill` — Éteindre le bot *(accès restreint)*',
                     ].join('\n'),
                 },
