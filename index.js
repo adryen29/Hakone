@@ -860,6 +860,22 @@ client.on('messageCreate', async (message) => {
         if (!destMember || !destMember.permissions.has(PermissionFlagsBits.Administrator))
             return message.reply('❌ Tu dois être **Administrateur** sur le serveur de destination.');
 
+        // ── Vérification que LE BOT a les permissions nécessaires sur le serveur de destination ──
+        // "Manage Channels" suffit pour les salons, mais "Manage Roles" est requis pour
+        // supprimer/créer des rôles. De plus, peu importe les permissions, Discord interdit
+        // toujours au bot de gérer un rôle positionné AU-DESSUS de son propre rôle le plus haut.
+        const botMember = await dest.members.fetch(client.user.id).catch(() => null);
+        if (!botMember)
+            return message.reply('❌ Impossible de récupérer le rôle du bot sur le serveur de destination.');
+
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageChannels))
+            return message.reply('❌ Le bot n\'a pas la permission **Gérer les salons** sur le serveur de destination.');
+
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles))
+            return message.reply('❌ Le bot n\'a pas la permission **Gérer les rôles** sur le serveur de destination.');
+
+        const botHighestPos = botMember.roles.highest.position;
+
         // On mémorise la référence du salon SOURCE avant toute opération.
         // status.edit() peut échouer si le canal est retiré du cache pendant
         // des suppressions massives → safeEdit() bascule sur channel.send().
