@@ -11,6 +11,10 @@ const {
     ChannelType,
     EmbedBuilder,
     OverwriteType,
+    ButtonBuilder,       // ← NOUVEAU (tickets)
+    ButtonStyle,         // ← NOUVEAU (tickets)
+    ActionRowBuilder,    // ← NOUVEAU (tickets)
+    AttachmentBuilder,   // ← NOUVEAU (tickets / transcripts)
 } = require('discord.js');
 const http = require('http');
 
@@ -56,6 +60,7 @@ const LOG = {
     snipe      : '1519491455750508805',
     safe       : '1519473513042542724',
     raid       : '1519474527829229639',
+    tickets    : '1519771795350098043', // ← Stockage persistant des tickets (sessions + panneaux)
 };
 
 // ============================================================
@@ -97,6 +102,15 @@ const safeList      = new Set(); // userId    → whitelisté RAID
 const tempBanTimers = new Map(); // userId    → timer auto-unban
 const raidTracker   = new Map(); // `gId_uId` → compteurs RAID
 const raidViolated  = new Set(); // `gId_uId` → déjà sanctionné (anti-double)
+
+// ── Tickets ─────────────────────────────────────────────────
+// ticketConfigs : configId → { categoryId, logsId, salonText,
+//                              beforeSalonId, titleText, mainText }
+const ticketConfigs  = new Map();
+
+// ticketSessions : channelId → { openerId, claimedBy,
+//                                guildId, configId, embedMsgId }
+const ticketSessions = new Map();
 
 // ============================================================
 // 🛠️  HELPERS
@@ -147,6 +161,121 @@ function isExempt(user) {
     if (EXEMPT_IDS.includes(user.id)) return true;
     if (safeList.has(user.id)) return true;
     return false;
+}
+
+// ============================================================
+// 🎫 HELPERS TICKETS
+// ============================================================
+
+/**
+ * Parse les paramètres de la commande +CreateTicket.
+ * Supporte Key:(valeur avec espaces) et Key:valeurSimple.
+ */
+function parseTicketArgs(content) {
+    const params = {};
+    // Paramètres avec parenthèses : Key:(valeur) — supporte espaces et caractères spéciaux
+    const parenRegex = /(\w+):\(([^)]+)\)/gi;
+    let m;
+    while ((m = parenRegex.exec(content)) !== null) {
+        params[m[1].toLowerCase()] = m[2].trim();
+    }
+    // Paramètres sans parenthèses : Key:valeur — jusqu'au prochain espace
+    const simpleRegex = /(\w+):([^\s(][^\s]*)/gi;
+    while ((m = simpleRegex.exec(content)) !== null) {
+        const key = m[1].toLowerCase();
+        if (!params[key]) params[key] = m[2].trim();
+    }
+    return params;
+}
+
+/**
+ * Construit les boutons du panneau intérieur d'un ticket.
+ * Séparé en fonction pour pouvoir les reconstruire facilement.
+ */
+function buildTicketRow(isClaimed = false, claimedById = null) {
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('ticket_close')
+            .setLabel('🔒 Fermer le ticket')
+            .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+            .setCustomId('ticket_claim')
+            .setLabel(isClaimed ? `✅ Pris en charge` : '🙋 Prendre en charge')
+            .setStyle(isClaimed ? ButtonStyle.Secondary : ButtonStyle.Success)
+            .setDisabled(isClaimed),
+    );
+    return row;
+}
+
+/**
+ * Construit l'embed de tracking d'un TICKET OUVERT dans LOG.tickets.
+ * La description contient un bloc JSON machine-readable pour la restauration.
+ * Les champs affichent les infos humaines.
+ *
+ * @param {string} channelId   ID du salon ticket
+ * @param {object} session     Objet session (ticketSessions)
+ * @param {object} config      Objet config (ticketConfigs)
+ */
+function buildTicketTrackEmbed(channelId, session, config) {
+    const payload = JSON.stringify({
+        type         : 'ticket',
+        channelId,
+        openerId     : session.openerId,
+        claimedBy    : session.claimedBy,
+        guildId      : session.guildId,
+        configId     : session.configId,
+        embedMsgId   : session.embedMsgId,
+        categoryId   : config.categoryId,
+        logsId       : config.logsId,
+        beforeSalonId: config.beforeSalonId,
+        salonText    : config.salonText,
+        titleText    : config.titleText,
+        mainText     : config.mainText,
+    });
+
+    return new EmbedBuilder()
+        .setColor(session.claimedBy ? 0xFEE75C : 0x57F287)
+        .setTitle('🎫 Ticket actif')
+        .setDescription('```json\n' + payload.slice(0, 4090) + '\n```')
+        .addFields(
+            { name: '🎫 Salon',         value: `<#${channelId}>`,                                              inline: true },
+            { name: '👤 Ouvert par',    value: `<@${session.openerId}>`,                                       inline: true },
+            { name: '🙋 Pris en charge',value: session.claimedBy ? `<@${session.claimedBy}>` : '*(aucun)*',   inline: true },
+        )
+        .setTimestamp();
+}
+
+/**
+ * Construit l'embed de tracking d'un PANNEAU dans LOG.tickets.
+ * Permet de restaurer les ticketConfigs au redémarrage (boutons d'ouverture).
+ *
+ * @param {string} configId   Clé de la config
+ * @param {object} config     Objet config (ticketConfigs)
+ * @param {string} panelChannelId  Salon où le panneau a été posté
+ * @param {string} guildId    ID du serveur
+ */
+function buildPanelTrackEmbed(configId, config, panelChannelId, guildId) {
+    const payload = JSON.stringify({
+        type         : 'panel',
+        configId,
+        guildId,
+        categoryId   : config.categoryId,
+        logsId       : config.logsId,
+        beforeSalonId: config.beforeSalonId,
+        salonText    : config.salonText,
+        titleText    : config.titleText,
+        mainText     : config.mainText,
+    });
+
+    return new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('📋 Panneau de tickets')
+        .setDescription('```json\n' + payload.slice(0, 4090) + '\n```')
+        .addFields(
+            { name: '📌 Salon du panneau', value: `<#${panelChannelId}>`, inline: true },
+            { name: '🗂️ Catégorie cible',  value: `<#${config.categoryId}>`, inline: true },
+        )
+        .setTimestamp();
 }
 
 // ============================================================
@@ -398,6 +527,105 @@ async function restoreFromLogs(guild) {
         console.log(`[RESTORE] tempBanTimers : ${tempBanTimers.size} timer(s) replanifié(s)`);
     } catch (e) {
         console.error('[RESTORE] tempBanTimers :', e.message);
+    }
+
+    // ── 3. Reconstruction des tickets et panneaux ───────────
+    // On lit LOG.tickets : chaque message du bot contient un bloc JSON
+    // décrivant soit un panneau (type:'panel') soit un ticket ouvert (type:'ticket').
+    try {
+        const trackCh = guild.channels.cache.get(LOG.tickets);
+        if (!trackCh?.isTextBased()) {
+            console.warn('[RESTORE] tickets : salon de tracking introuvable.');
+        } else {
+            const msgs = await trackCh.messages.fetch({ limit: 100 });
+            const botMsgs = [...msgs.values()]
+                .filter(m => m.author.id === client.user.id)
+                .reverse(); // ordre chronologique
+
+            let panelsRestored  = 0;
+            let ticketsRestored = 0;
+            let ticketsCleaned  = 0;
+
+            for (const msg of botMsgs) {
+                const embed = msg.embeds[0];
+                if (!embed?.description) continue;
+
+                // ── Extraction du bloc JSON ────────────────
+                const jsonMatch = embed.description.match(/```json\n([\s\S]+?)\n```/);
+                if (!jsonMatch) continue;
+
+                let data;
+                try {
+                    data = JSON.parse(jsonMatch[1]);
+                } catch (parseErr) {
+                    console.error('[RESTORE] tickets — JSON invalide :', parseErr.message);
+                    continue;
+                }
+
+                // ── CAS 1 : Panneau de tickets ─────────────
+                // Restaure ticketConfigs pour que les boutons d'ouverture
+                // déjà postés dans le serveur continuent de fonctionner.
+                if (data.type === 'panel') {
+                    if (!ticketConfigs.has(data.configId)) {
+                        ticketConfigs.set(data.configId, {
+                            categoryId   : data.categoryId,
+                            logsId       : data.logsId,
+                            salonText    : data.salonText,
+                            beforeSalonId: data.beforeSalonId,
+                            titleText    : data.titleText,
+                            mainText     : data.mainText,
+                        });
+                        panelsRestored++;
+                    }
+                    continue;
+                }
+
+                // ── CAS 2 : Ticket ouvert ──────────────────
+                if (data.type !== 'ticket') continue;
+
+                // Vérifie que le salon ticket existe encore
+                // (peut avoir été supprimé manuellement pendant le downtime)
+                const ticketCh = guild.channels.cache.get(data.channelId);
+                if (!ticketCh) {
+                    // Salon disparu → on nettoie le log automatiquement
+                    await msg.delete().catch(() => {});
+                    ticketsCleaned++;
+                    continue;
+                }
+
+                // Restaure la config si elle n'est pas déjà en mémoire
+                if (!ticketConfigs.has(data.configId)) {
+                    ticketConfigs.set(data.configId, {
+                        categoryId   : data.categoryId,
+                        logsId       : data.logsId,
+                        salonText    : data.salonText,
+                        beforeSalonId: data.beforeSalonId,
+                        titleText    : data.titleText,
+                        mainText     : data.mainText,
+                    });
+                }
+
+                // Restaure la session
+                ticketSessions.set(data.channelId, {
+                    channelId  : data.channelId,
+                    openerId   : data.openerId,
+                    claimedBy  : data.claimedBy  || null,
+                    guildId    : data.guildId,
+                    configId   : data.configId,
+                    embedMsgId : data.embedMsgId || null,
+                    logMsgId   : msg.id,           // ID du message dans LOG.tickets
+                });
+                ticketsRestored++;
+            }
+
+            console.log(
+                `[RESTORE] tickets : ${panelsRestored} panneau(x), ` +
+                `${ticketsRestored} ticket(s) restauré(s), ` +
+                `${ticketsCleaned} log(s) nettoyé(s) (salons disparus)`
+            );
+        }
+    } catch (e) {
+        console.error('[RESTORE] tickets :', e.message);
     }
 }
 
@@ -849,9 +1077,6 @@ client.on('messageCreate', async (message) => {
                 `❌ Serveur de destination introuvable (\`${toId}\`). Le bot est-il bien présent sur ce serveur ?`
             );
 
-        // ── Vérification que l'auteur est bien Administrateur sur LES DEUX serveurs ──
-        // (la vérification au-dessus ne portait que sur le serveur où la commande est tapée,
-        //  qui peut être un troisième serveur "panel" différent de from/to)
         const srcMember = await src.members.fetch(message.author.id).catch(() => null);
         if (!srcMember || !srcMember.permissions.has(PermissionFlagsBits.Administrator))
             return message.reply('❌ Tu dois être **Administrateur** sur le serveur source.');
@@ -860,10 +1085,6 @@ client.on('messageCreate', async (message) => {
         if (!destMember || !destMember.permissions.has(PermissionFlagsBits.Administrator))
             return message.reply('❌ Tu dois être **Administrateur** sur le serveur de destination.');
 
-        // ── Vérification que LE BOT a les permissions nécessaires sur le serveur de destination ──
-        // "Manage Channels" suffit pour les salons, mais "Manage Roles" est requis pour
-        // supprimer/créer des rôles. De plus, peu importe les permissions, Discord interdit
-        // toujours au bot de gérer un rôle positionné AU-DESSUS de son propre rôle le plus haut.
         const botMember = await dest.members.fetch(client.user.id).catch(() => null);
         if (!botMember)
             return message.reply('❌ Impossible de récupérer le rôle du bot sur le serveur de destination.');
@@ -874,21 +1095,11 @@ client.on('messageCreate', async (message) => {
         if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles))
             return message.reply('❌ Le bot n\'a pas la permission **Gérer les rôles** sur le serveur de destination.');
 
-        const botHighestPos = botMember.roles.highest.position;
-
-        // On mémorise la référence du salon SOURCE avant toute opération.
-        // status.edit() peut échouer si le canal est retiré du cache pendant
-        // des suppressions massives → safeEdit() bascule sur channel.send().
         const replyChannel = message.channel;
         let status = await message.reply(
             `⏳ Backup en cours… **${src.name}** → **${dest.name}** (suppression puis reconstruction)`
         );
 
-        /**
-         * Édite le message de statut de façon sécurisée.
-         * Si le canal n'est plus en cache (ChannelNotCached), envoie un
-         * nouveau message dans le salon source à la place.
-         */
         const safeEdit = async (text) => {
             try {
                 status = await status.edit(text);
@@ -905,22 +1116,13 @@ client.on('messageCreate', async (message) => {
         let rolesOk = 0, chOk = 0, delOk = 0, errs = 0;
 
         try {
-            // ────────────────────────────────────────────────
-            // ÉTAPE 0 — Rafraîchissement des caches
-            // ────────────────────────────────────────────────
             await safeEdit('🔄 Rafraîchissement des caches…');
             await dest.channels.fetch();
             await dest.roles.fetch();
             await src.channels.fetch();
             await src.roles.fetch();
 
-            // ────────────────────────────────────────────────
-            // ÉTAPE 1 — Nettoyage du serveur de backup
-            // On snapshote les collections AVANT de supprimer
-            // pour éviter les bugs d'itérateur sur cache muté.
-            // ────────────────────────────────────────────────
             await safeEdit('🗑️ Suppression des salons du serveur de backup…');
-
             const channelsToDelete = [...dest.channels.cache.values()];
             for (const ch of channelsToDelete) {
                 try { await ch.delete('Nettoyage avant backup'); delOk++; }
@@ -928,7 +1130,6 @@ client.on('messageCreate', async (message) => {
             }
 
             await safeEdit('🗑️ Suppression des rôles du serveur de backup…');
-
             const rolesToDelete = [...dest.roles.cache.values()]
                 .filter(r => r.id !== dest.id && !r.managed);
             for (const r of rolesToDelete) {
@@ -936,20 +1137,10 @@ client.on('messageCreate', async (message) => {
                 catch (e) { console.error('[BACKUP] del role:', e.message); errs++; }
             }
 
-            // ────────────────────────────────────────────────
-            // ÉTAPE 2 — Copie des rôles
-            // ────────────────────────────────────────────────
             await safeEdit('👑 Copie des rôles en cours…');
-
             const roleMap = new Map();
             roleMap.set(src.roles.everyone.id, dest.roles.everyone.id);
 
-            // Discord crée toujours un nouveau rôle à la position 1 (juste au-dessus
-            // de @everyone), peu importe la position passée à roles.create(). Si on
-            // crée les rôles du plus bas au plus haut, chaque nouveau rôle finit en
-            // dessous du précédent → hiérarchie inversée à l'arrivée.
-            // Solution : on crée les rôles du PLUS HAUT au PLUS BAS, ainsi chaque
-            // nouveau rôle vient bien se placer sous les rôles déjà recréés.
             const roles = [...src.roles.cache.values()]
                 .filter(r => r.id !== src.id && !r.managed)
                 .sort((a, b) => b.position - a.position);
@@ -969,7 +1160,6 @@ client.on('messageCreate', async (message) => {
                 } catch (e) { console.error('[BACKUP] create role:', e.message); errs++; }
             }
 
-            // Helper : mappe les permissionOverwrites source → IDs du serveur dest
             function mapOverwrites(channel) {
                 return channel.permissionOverwrites.cache
                     .map(po => {
@@ -982,11 +1172,7 @@ client.on('messageCreate', async (message) => {
                     .filter(Boolean);
             }
 
-            // ────────────────────────────────────────────────
-            // ÉTAPE 3 — Copie des catégories
-            // ────────────────────────────────────────────────
             await safeEdit('📁 Copie des catégories en cours…');
-
             const catMap = new Map();
             const cats = [...src.channels.cache.values()]
                 .filter(c => c.type === ChannelType.GuildCategory)
@@ -1006,11 +1192,7 @@ client.on('messageCreate', async (message) => {
                 } catch (e) { console.error('[BACKUP] create cat:', e.message); errs++; }
             }
 
-            // ────────────────────────────────────────────────
-            // ÉTAPE 4 — Copie des salons (texte, vocal, etc.)
-            // ────────────────────────────────────────────────
             await safeEdit('💬 Copie des salons en cours…');
-
             const channels = [...src.channels.cache.values()]
                 .filter(c => c.type !== ChannelType.GuildCategory)
                 .sort((a, b) => a.position - b.position);
@@ -1046,9 +1228,89 @@ client.on('messageCreate', async (message) => {
 
         } catch (err) {
             console.error('[BACKUP]', err);
-            // safeEdit ici aussi pour éviter un second crash si le canal est mort
             await safeEdit('❌ Erreur critique lors du backup. Vérifie les permissions du bot sur les deux serveurs.');
         }
+    }
+
+    // ────────────────────────────────────────────────────────
+    // +CreateTicket Tittle:(…) Text:(…) AimedCategory:<ID>
+    //               Logs:<ID> SalonText:(…) BeforeSalonID:<texte>
+    // ────────────────────────────────────────────────────────
+    else if (command === 'createticket') {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator))
+            return message.reply('❌ Permission **Administrateur** requise.');
+
+        // Récupère tout ce qui suit "+createticket "
+        const rawArgs = message.content.slice(PREFIX.length + 'createticket'.length).trim();
+        const p       = parseTicketArgs(rawArgs);
+
+        // Aliases insensibles à la casse
+        const title          = p['tittle']        || p['title'];
+        const mainText       = p['text'];
+        const categoryId     = p['aimedcategory'] || p['aimed_category'] || p['category'];
+        const logsId         = p['logs'];
+        const salonText      = p['salontext']     || p['salon_text'];
+        const beforeSalonId  = p['beforesalonid'] || p['before_salon_id'] || p['beforesalon'];
+
+        // ── Validation des paramètres ──────────────────────
+        const missing = [];
+        if (!title)         missing.push('`Tittle:(…)`');
+        if (!mainText)      missing.push('`Text:(…)`');
+        if (!categoryId)    missing.push('`AimedCategory:<ID>`');
+        if (!logsId)        missing.push('`Logs:<ID>`');
+        if (!salonText)     missing.push('`SalonText:(…)`');
+        if (!beforeSalonId) missing.push('`BeforeSalonID:<texte>`');
+
+        if (missing.length > 0) {
+            return message.reply(
+                `❌ Paramètre(s) manquant(s) : ${missing.join(', ')}\n\n` +
+                `**Usage :** \`+CreateTicket Tittle:(titre) Text:(texte) AimedCategory:<ID> Logs:<ID> SalonText:(texte) BeforeSalonID:<préfixe>\``
+            );
+        }
+
+        // ── Vérification de la catégorie ───────────────────
+        const category = message.guild.channels.cache.get(categoryId);
+        if (!category || category.type !== ChannelType.GuildCategory)
+            return message.reply(`❌ Catégorie introuvable avec l'ID \`${categoryId}\`. Vérifiez l'ID.`);
+
+        // ── Vérification du salon de logs ──────────────────
+        const logsCh = message.guild.channels.cache.get(logsId);
+        if (!logsCh?.isTextBased())
+            return message.reply(`❌ Salon de logs introuvable avec l'ID \`${logsId}\`. Vérifiez l'ID.`);
+
+        // ── Stockage de la config ──────────────────────────
+        // La clé est basée sur le timestamp pour garantir l'unicité
+        const configId = `tc_${Date.now()}_${message.guild.id}`;
+        ticketConfigs.set(configId, {
+            categoryId,
+            logsId,
+            salonText,
+            beforeSalonId,
+            titleText : title,
+            mainText,
+        });
+
+        // ── Panneau d'ouverture de ticket ──────────────────
+        const panelEmbed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle(title)
+            .setDescription(mainText)
+            .setTimestamp()
+            .setFooter({ text: `Serveur ${message.guild.name}` });
+
+        const panelRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`ticket_open_${configId}`)
+                .setLabel('🎫 Ouvrir un ticket')
+                .setStyle(ButtonStyle.Primary)
+        );
+
+        await message.channel.send({ embeds: [panelEmbed], components: [panelRow] });
+
+        // Supprime la commande pour garder le salon propre
+        await message.delete().catch(() => {});
+
+        console.log(`[TICKET] Panneau créé — configId: ${configId} — salon: #${message.channel.name}`);
     }
 
     // ────────────────────────────────────────────────────────
@@ -1082,6 +1344,23 @@ client.on('messageCreate', async (message) => {
                     ].join('\n'),
                 },
                 {
+                    name  : '🎫 Système de tickets',
+                    value : [
+                        '`+CreateTicket Tittle:(…) Text:(…) AimedCategory:<ID> Logs:<ID> SalonText:(…) BeforeSalonID:<préfixe>`',
+                        '> Crée un panneau d\'ouverture de tickets dans le salon courant.',
+                        '> **Tittle** — Titre de l\'embed du panneau',
+                        '> **Text** — Description de l\'embed du panneau',
+                        '> **AimedCategory** — ID de la catégorie où créer les tickets',
+                        '> **Logs** — ID du salon où envoyer les transcripts à la fermeture',
+                        '> **SalonText** — Texte de l\'embed affiché à l\'intérieur du ticket',
+                        '> **BeforeSalonID** — Préfixe du nom du salon (ex: `ticket` → `ticket_123456789`)',
+                        '',
+                        'Boutons disponibles **dans chaque ticket** :',
+                        '> 🙋 **Prendre en charge** — Assigne le ticket à un modérateur',
+                        '> 🔒 **Fermer le ticket** — Sauvegarde le transcript et supprime le salon',
+                    ].join('\n'),
+                },
+                {
                     name  : '⚙️ Utilitaires',
                     value : [
                         '`+DmAll <message>` — Envoie un DM à tous les membres',
@@ -1108,6 +1387,365 @@ client.on('messageCreate', async (message) => {
             .setTimestamp();
 
         message.reply({ embeds: [embed] });
+    }
+});
+
+// ============================================================
+// 🎫 GESTIONNAIRE D'INTERACTIONS (boutons des tickets)
+// ============================================================
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    const { customId, guild, user, channel } = interaction;
+
+    // ────────────────────────────────────────────────────────
+    // Bouton : Ouvrir un ticket
+    // customId = "ticket_open_<configId>"
+    // ────────────────────────────────────────────────────────
+    if (customId.startsWith('ticket_open_')) {
+        const configId = customId.slice('ticket_open_'.length);
+        const config   = ticketConfigs.get(configId);
+
+        if (!config) {
+            return interaction.reply({
+                content : '❌ Configuration introuvable. Le bot a peut-être redémarré depuis la création de ce panneau.',
+                ephemeral: true,
+            });
+        }
+
+        // ── Anti-doublon : un seul ticket ouvert par utilisateur ──
+        const existing = [...ticketSessions.entries()].find(
+            ([, s]) => s.openerId === user.id && s.guildId === guild.id
+        );
+        if (existing) {
+            return interaction.reply({
+                content  : `❌ Tu as déjà un ticket ouvert : <#${existing[0]}>`,
+                ephemeral: true,
+            });
+        }
+
+        // Defer pour éviter le timeout si la création prend du temps
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            // ── Sanitize le nom du salon ───────────────────
+            // Discord : lettres, chiffres, tirets, underscores, max 100 chars
+            const rawName    = `${config.beforeSalonId}_${user.id}`;
+            const channelName = rawName
+                .toLowerCase()
+                .replace(/\s+/g, '-')
+                .replace(/[^a-z0-9_-]/g, '')
+                .slice(0, 100);
+
+            // ── Création du salon de ticket ────────────────
+            const ticketChannel = await guild.channels.create({
+                name  : channelName,
+                type  : ChannelType.GuildText,
+                parent: config.categoryId,
+                permissionOverwrites: [
+                    // @everyone : invisible
+                    {
+                        id   : guild.roles.everyone,
+                        deny : [PermissionFlagsBits.ViewChannel],
+                    },
+                    // Créateur du ticket : peut voir, écrire, lire
+                    {
+                        id   : user.id,
+                        allow: [
+                            PermissionFlagsBits.ViewChannel,
+                            PermissionFlagsBits.SendMessages,
+                            PermissionFlagsBits.ReadMessageHistory,
+                            PermissionFlagsBits.AttachFiles,
+                        ],
+                    },
+                    // Le bot lui-même : accès complet pour gérer le salon
+                    {
+                        id   : client.user.id,
+                        allow: [
+                            PermissionFlagsBits.ViewChannel,
+                            PermissionFlagsBits.SendMessages,
+                            PermissionFlagsBits.ReadMessageHistory,
+                            PermissionFlagsBits.ManageChannels,
+                            PermissionFlagsBits.ManageMessages,
+                            PermissionFlagsBits.AttachFiles,
+                        ],
+                    },
+                ],
+                reason: `Ticket ouvert par ${user.tag}`,
+            });
+
+            // ── Stockage de la session ─────────────────────
+            ticketSessions.set(ticketChannel.id, {
+                openerId   : user.id,
+                claimedBy  : null,
+                guildId    : guild.id,
+                configId,
+                embedMsgId : null,  // renseigné juste après
+            });
+
+            // ── Embed intérieur du ticket ──────────────────
+            const ticketEmbed = new EmbedBuilder()
+                .setColor(0x57F287)
+                .setTitle('🎫 Ticket ouvert')
+                .setDescription(config.salonText)
+                .addFields(
+                    { name: '👤 Ouvert par', value: `${user} \`(${user.id})\``,  inline: true },
+                    { name: '📌 Statut',     value: '🟢 Ouvert — en attente',    inline: true },
+                )
+                .setTimestamp()
+                .setFooter({ text: `Ticket créé par ${user.tag}` });
+
+            const ticketRow = buildTicketRow(false);
+
+            const embedMsg = await ticketChannel.send({
+                content : `${user} — Bienvenue dans ton ticket !`,
+                embeds  : [ticketEmbed],
+                components: [ticketRow],
+            });
+
+            // ── Mémorise l'ID du message embed ────────────
+            ticketSessions.get(ticketChannel.id).embedMsgId = embedMsg.id;
+
+            // ── Réponse éphémère à l'utilisateur ──────────
+            await interaction.editReply({
+                content: `✅ Ton ticket a été créé : ${ticketChannel}`,
+            });
+
+            console.log(`[TICKET] Ouvert — ${ticketChannel.name} par ${user.tag}`);
+
+        } catch (e) {
+            console.error('[TICKET] open :', e.message);
+            await interaction.editReply({
+                content: '❌ Erreur lors de la création du ticket. Vérifiez les permissions du bot dans la catégorie.',
+            });
+        }
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Bouton : Prendre en charge
+    // ────────────────────────────────────────────────────────
+    else if (customId === 'ticket_claim') {
+        const session = ticketSessions.get(channel.id);
+        if (!session) {
+            return interaction.reply({
+                content  : '❌ Session de ticket introuvable.',
+                ephemeral: true,
+            });
+        }
+
+        // ── Vérification des permissions ──────────────────
+        const member = await guild.members.fetch(user.id).catch(() => null);
+        if (!member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+            return interaction.reply({
+                content  : '❌ Permission **Gérer les messages** requise pour prendre en charge un ticket.',
+                ephemeral: true,
+            });
+        }
+
+        // ── Anti-doublon claim ─────────────────────────────
+        if (session.claimedBy) {
+            return interaction.reply({
+                content  : `❌ Ce ticket est déjà pris en charge par <@${session.claimedBy}>.`,
+                ephemeral: true,
+            });
+        }
+
+        session.claimedBy = user.id;
+
+        // ── Ajoute les permissions du claimer au salon ─────
+        await channel.permissionOverwrites.edit(user.id, {
+            ViewChannel       : true,
+            SendMessages      : true,
+            ReadMessageHistory: true,
+            AttachFiles       : true,
+        }).catch(e => console.error('[TICKET] claim perms :', e.message));
+
+        // ── Met à jour l'embed du ticket ───────────────────
+        try {
+            if (session.embedMsgId) {
+                const embedMsg = await channel.messages.fetch(session.embedMsgId);
+                const updatedEmbed = EmbedBuilder.from(embedMsg.embeds[0])
+                    .setColor(0xFEE75C)
+                    .spliceFields(1, 1, {
+                        name  : '📌 Statut',
+                        value : `🟡 Pris en charge par ${user}`,
+                        inline: true,
+                    });
+
+                await embedMsg.edit({
+                    embeds    : [updatedEmbed],
+                    components: [buildTicketRow(true, user.id)],
+                });
+            }
+        } catch (e) {
+            console.error('[TICKET] claim embed update :', e.message);
+        }
+
+        await interaction.reply({
+            embeds: [
+                new EmbedBuilder()
+                    .setColor(0xFEE75C)
+                    .setDescription(`🙋 **${user.tag}** a pris en charge ce ticket.`)
+                    .setTimestamp(),
+            ],
+        });
+
+        console.log(`[TICKET] Pris en charge — ${channel.name} par ${user.tag}`);
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Bouton : Fermer le ticket
+    // ────────────────────────────────────────────────────────
+    else if (customId === 'ticket_close') {
+        const session = ticketSessions.get(channel.id);
+        if (!session) {
+            return interaction.reply({
+                content  : '❌ Session de ticket introuvable.',
+                ephemeral: true,
+            });
+        }
+
+        // ── Vérification : auteur du ticket ou modérateur ──
+        const member    = await guild.members.fetch(user.id).catch(() => null);
+        const isOpener  = user.id === session.openerId;
+        const hasPerms  = member?.permissions.has(PermissionFlagsBits.ManageMessages);
+
+        if (!isOpener && !hasPerms) {
+            return interaction.reply({
+                content  : '❌ Seul l\'auteur du ticket ou un modérateur peut fermer ce ticket.',
+                ephemeral: true,
+            });
+        }
+
+        // Réponse immédiate visible dans le ticket avant fermeture
+        await interaction.reply({
+            embeds: [
+                new EmbedBuilder()
+                    .setColor(0xFF0000)
+                    .setDescription(`🔒 Fermeture du ticket en cours… (sauvegarde du transcript)`)
+                    .setTimestamp(),
+            ],
+        });
+
+        try {
+            // ── Collecte TOUS les messages du salon ────────
+            // Discord limite à 100 par requête → on pagine
+            let allMessages = [];
+            let lastId      = null;
+
+            while (true) {
+                const opts = { limit: 100 };
+                if (lastId) opts.before = lastId;
+                const batch = await channel.messages.fetch(opts);
+                if (batch.size === 0) break;
+                allMessages = allMessages.concat([...batch.values()]);
+                lastId = batch.last().id;
+                if (batch.size < 100) break;
+            }
+
+            // Remet les messages dans l'ordre chronologique
+            allMessages.reverse();
+
+            // ── Formatage du transcript .txt ───────────────
+            const opener  = await client.users.fetch(session.openerId).catch(() => null);
+            const claimer = session.claimedBy
+                ? await client.users.fetch(session.claimedBy).catch(() => null)
+                : null;
+
+            const lines = allMessages.map(m => {
+                const dt          = new Date(m.createdTimestamp).toISOString();
+                const attachTxt   = m.attachments.size > 0
+                    ? ` [📎 ${m.attachments.map(a => a.url).join(' | ')}]`
+                    : '';
+                const embedTxt    = m.embeds.length > 0 ? ' [embed]' : '';
+                const content     = m.content || '(aucun texte)';
+                return `[${dt}] ${m.author.tag} (${m.author.id}) : ${content}${attachTxt}${embedTxt}`;
+            });
+
+            const transcript = [
+                '╔══════════════════════════════════════════╗',
+                `║  TRANSCRIPT DU TICKET : ${channel.name.padEnd(17)}║`,
+                '╚══════════════════════════════════════════╝',
+                '',
+                `Serveur    : ${guild.name} (${guild.id})`,
+                `Ouvert par : ${opener ? `${opener.tag} (${opener.id})` : `ID: ${session.openerId}`}`,
+                `Pris en charge par : ${claimer ? `${claimer.tag} (${claimer.id})` : 'Non pris en charge'}`,
+                `Fermé par  : ${user.tag} (${user.id})`,
+                `Date       : ${new Date().toISOString()}`,
+                `Messages   : ${allMessages.length}`,
+                '',
+                '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+                '',
+                ...lines,
+                '',
+                '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+                `Fin du transcript — ${new Date().toISOString()}`,
+            ].join('\n');
+
+            const attachment = new AttachmentBuilder(
+                Buffer.from(transcript, 'utf-8'),
+                { name: `transcript_${channel.name}_${Date.now()}.txt` }
+            );
+
+            // ── Envoi dans le salon de logs ────────────────
+            const config = ticketConfigs.get(session.configId);
+            if (config) {
+                const logsCh = guild.channels.cache.get(config.logsId);
+                if (logsCh?.isTextBased()) {
+                    await logsCh.send({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setColor(0xFF4444)
+                                .setTitle('📁 Ticket fermé — Transcript')
+                                .addFields(
+                                    {
+                                        name  : '🎫 Salon',
+                                        value : `\`${channel.name}\``,
+                                        inline: true,
+                                    },
+                                    {
+                                        name  : '👤 Ouvert par',
+                                        value : opener
+                                            ? `${opener.tag} \`(${opener.id})\``
+                                            : `\`${session.openerId}\``,
+                                        inline: true,
+                                    },
+                                    {
+                                        name  : '🔒 Fermé par',
+                                        value : `${user.tag} \`(${user.id})\``,
+                                        inline: true,
+                                    },
+                                    {
+                                        name  : '🙋 Pris en charge par',
+                                        value : claimer
+                                            ? `${claimer.tag} \`(${claimer.id})\``
+                                            : '*(non pris en charge)*',
+                                        inline: true,
+                                    },
+                                    {
+                                        name  : '💬 Nombre de messages',
+                                        value : `${allMessages.length}`,
+                                        inline: true,
+                                    },
+                                )
+                                .setTimestamp(),
+                        ],
+                        files: [attachment],
+                    });
+                }
+            }
+
+            // ── Nettoyage + suppression du salon ──────────
+            ticketSessions.delete(channel.id);
+            await channel.delete(`Ticket fermé par ${user.tag}`);
+
+            console.log(`[TICKET] Fermé — ${channel.name} par ${user.tag}`);
+
+        } catch (e) {
+            console.error('[TICKET] close :', e.message);
+            // On ne peut plus envoyer dans le salon s'il a été supprimé
+            // → log uniquement en console
+        }
     }
 });
 
