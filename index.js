@@ -849,24 +849,40 @@ client.on('messageCreate', async (message) => {
 
         try {
             // ────────────────────────────────────────────────
-            // ÉTAPE 1 — Nettoyage complet du serveur de backup
-            // On supprime d'abord tous les salons puis tous les
-            // rôles pour repartir d'une ardoise vierge.
+            // ÉTAPE 0 — Rafraîchissement des caches
+            // Indispensable si le bot vient de démarrer ou si
+            // les caches sont incomplets.
             // ────────────────────────────────────────────────
-            await status.edit('🗑️ Nettoyage du serveur de backup en cours…');
+            await status.edit('🔄 Rafraîchissement des caches…');
+            await dest.channels.fetch();
+            await dest.roles.fetch();
+            await src.channels.fetch();
+            await src.roles.fetch();
 
-            // Supprime tous les salons (catégories incluses)
-            for (const [, ch] of dest.channels.cache) {
+            // ────────────────────────────────────────────────
+            // ÉTAPE 1 — Nettoyage complet du serveur de backup
+            // ⚠️  On snapshot les collections dans des tableaux
+            // AVANT de commencer les suppressions.
+            // Si on itère directement sur dest.channels.cache,
+            // les events channelDelete la modifient en live et
+            // l'itérateur plante silencieusement à mi-chemin.
+            // ────────────────────────────────────────────────
+            await status.edit('🗑️ Suppression des salons du serveur de backup…');
+
+            // Snapshot → tableau figé, immunisé contre les mises à jour du cache
+            const channelsToDelete = [...dest.channels.cache.values()];
+            for (const ch of channelsToDelete) {
                 try { await ch.delete('Nettoyage avant backup'); delOk++; }
-                catch { errs++; }
+                catch (e) { console.error('[BACKUP] del channel:', e.message); errs++; }
             }
 
-            // Supprime tous les rôles sauf @everyone et les rôles gérés (bots)
+            await status.edit('🗑️ Suppression des rôles du serveur de backup…');
+
             const rolesToDelete = [...dest.roles.cache.values()]
                 .filter(r => r.id !== dest.id && !r.managed);
             for (const r of rolesToDelete) {
                 try { await r.delete('Nettoyage avant backup'); }
-                catch { errs++; }
+                catch (e) { console.error('[BACKUP] del role:', e.message); errs++; }
             }
 
             // ────────────────────────────────────────────────
@@ -895,7 +911,7 @@ client.on('messageCreate', async (message) => {
                     });
                     roleMap.set(r.id, newRole.id);
                     rolesOk++;
-                } catch { errs++; }
+                } catch (e) { console.error('[BACKUP] create role:', e.message); errs++; }
             }
 
             // ────────────────────────────────────────────────
@@ -938,7 +954,7 @@ client.on('messageCreate', async (message) => {
                     });
                     catMap.set(c.id, newCat.id);
                     chOk++;
-                } catch { errs++; }
+                } catch (e) { console.error('[BACKUP] create cat:', e.message); errs++; }
             }
 
             // ────────────────────────────────────────────────
@@ -968,7 +984,7 @@ client.on('messageCreate', async (message) => {
 
                     await dest.channels.create(opts);
                     chOk++;
-                } catch { errs++; }
+                } catch (e) { console.error('[BACKUP] create channel:', e.message); errs++; }
             }
 
             await status.edit(
