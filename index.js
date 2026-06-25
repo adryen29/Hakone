@@ -50,15 +50,15 @@ const RAID_LIMITS = {
 
 // Salons de logs pour chaque type d'action
 const LOG = {
-    commands : '1519475032659857550',
-    ban      : '1519473192652112002',
-    tempban  : '1519472967640285313',
-    mute     : '1519473215746080778',
-    tempmute : '1519473058102902976',
-    allDeleted : '1519474678199095417', // 🗑️ TOUS les messages supprimés (log brut)
-    snipe      : '1519491455750508805', // 🔍 Résultats de la commande +snipe
-    safe     : '1519473513042542724',
-    raid     : '1519474527829229639',
+    commands   : '1519475032659857550',
+    ban        : '1519473192652112002',
+    tempban    : '1519472967640285313',
+    mute       : '1519473215746080778',
+    tempmute   : '1519473058102902976',
+    allDeleted : '1519474678199095417',
+    snipe      : '1519491455750508805',
+    safe       : '1519473513042542724',
+    raid       : '1519474527829229639',
 };
 
 // ============================================================
@@ -76,6 +76,20 @@ const client = new Client({
         GatewayIntentBits.MessageContent, // ⚠️ Privileged
         GatewayIntentBits.GuildModeration,
     ],
+});
+
+// ============================================================
+// 🔴 GESTIONNAIRES D'ERREURS GLOBAUX
+// Empêche le bot de crasher sur une promesse rejetée non gérée
+// ============================================================
+client.on('error', (e) => console.error('[CLIENT ERROR]', e.message));
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED REJECTION]', reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT EXCEPTION]', err.message);
 });
 
 // ============================================================
@@ -262,13 +276,11 @@ client.on('channelUpdate', async (oldCh, newCh) => {
 // 💬 SYSTÈME SNIPE — capture des messages supprimés
 // ============================================================
 client.on('messageDelete', async (message) => {
-    // Ignore les messages partiels (non mis en cache par Discord)
     if (message.partial || !message.guild) return;
 
     const deletedAt = Date.now();
 
     // ── 1. Log brut de TOUS les messages supprimés ──────────
-    // (bots inclus, même sans texte — on note les pièces jointes)
     try {
         const desc = message.content || '*(pas de contenu textuel)*';
         const attachments = message.attachments.size > 0
@@ -295,10 +307,8 @@ client.on('messageDelete', async (message) => {
     }
 
     // ── 2. Stockage pour la commande +snipe ─────────────────
-    // Uniquement si l'auteur n'est pas un bot et qu'il y a du texte
     if (!message.author || message.author.bot || !message.content) return;
 
-    // Récupère les 5 messages envoyés juste avant le message supprimé
     let context = [];
     try {
         const fetched = await message.channel.messages.fetch({
@@ -306,7 +316,7 @@ client.on('messageDelete', async (message) => {
             limit  : 5,
         });
         context = [...fetched.values()]
-            .reverse() // du plus ancien au plus récent
+            .reverse()
             .map(m => ({
                 content   : m.content || '*(pas de texte)*',
                 authorTag : m.author.tag,
@@ -321,36 +331,24 @@ client.on('messageDelete', async (message) => {
         channelId   : message.channel.id,
         channelName : message.channel.name,
         deletedAt,
-        context,       // 5 messages au-dessus du message supprimé
+        context,
     });
 });
 
 // ============================================================
 // 🔄 RESTAURATION DE L'ÉTAT AU DÉMARRAGE
-// Relit les salons de logs Discord pour reconstruire :
-//   • safeList      (LOG.safe    — ajouts ET retraits)
-//   • tempBanTimers (LOG.tempban — bans pas encore expirés)
 // ============================================================
-
-/**
- * Relit les 100 derniers messages d'un salon de log du bot.
- * Retourne les messages triés du plus ancien au plus récent.
- */
 async function fetchBotLogs(guild, channelId) {
     const ch = guild.channels.cache.get(channelId);
     if (!ch?.isTextBased()) return [];
     const messages = await ch.messages.fetch({ limit: 100 });
     return [...messages.values()]
         .filter(m => m.author.id === client.user.id)
-        .reverse(); // oldest → newest pour rejouer l'historique dans l'ordre
+        .reverse();
 }
 
 async function restoreFromLogs(guild) {
     // ── 1. Reconstruction de la safeList ───────────────────
-    //   +removesafe supprime physiquement le message "Ajout"
-    //   du salon, donc seuls les messages encore présents
-    //   correspondent à des membres actuellement whitelistés.
-    //   Pas besoin de gérer un état "Retrait" : s'il est là → in, sinon → out.
     try {
         const msgs = await fetchBotLogs(guild, LOG.safe);
         for (const msg of msgs) {
@@ -371,8 +369,6 @@ async function restoreFromLogs(guild) {
     }
 
     // ── 2. Reconstruction des timers de tempban ─────────────
-    //   Pour chaque tempban encore actif, on recalcule le temps
-    //   restant et on replanifie le unban automatique.
     try {
         const msgs = await fetchBotLogs(guild, LOG.tempban);
         for (const msg of msgs) {
@@ -391,7 +387,6 @@ async function restoreFromLogs(guild) {
             const expireAt  = msg.createdTimestamp + hours * 3_600_000;
             const remaining = expireAt - Date.now();
 
-            // Déjà expiré ou timer déjà planifié (on garde le plus récent)
             if (remaining <= 0) continue;
             if (tempBanTimers.has(userId)) clearTimeout(tempBanTimers.get(userId));
 
@@ -415,7 +410,6 @@ async function restoreFromLogs(guild) {
 client.once('ready', async () => {
     console.log(`[BOT] ✅ Connecté en tant que ${client.user.tag}`);
 
-    // Restaure l'état pour chaque serveur où le bot est présent
     for (const [, guild] of client.guilds.cache) {
         await restoreFromLogs(guild);
     }
@@ -722,8 +716,6 @@ client.on('messageCreate', async (message) => {
 
         if (!entry) return message.reply('❌ Aucun message supprimé récemment trouvé.');
 
-        // ── Construit la description avec le contexte ────────
-        // Affiche les 5 messages au-dessus puis le message supprimé mis en évidence
         let desc = '';
 
         if (entry.context?.length) {
@@ -804,7 +796,6 @@ client.on('messageCreate', async (message) => {
 
         safeList.delete(target.id);
 
-        // Cherche et supprime le message "Ajout" correspondant dans le salon de log
         try {
             const safeCh = message.guild.channels.cache.get(LOG.safe);
             if (safeCh?.isTextBased()) {
@@ -843,40 +834,67 @@ client.on('messageCreate', async (message) => {
                 'Le bot est-il bien présent sur ce serveur ?'
             );
 
-        const status = await message.reply('⏳ Backup en cours… (suppression puis reconstruction)');
+        // ⚠️ GARDE ANTI-MÊME-SERVEUR
+        // Si SECOND_SERVER_ID pointe vers le serveur source, le backup
+        // supprimerait le salon où la commande a été tapée → crash garanti.
+        if (dest.id === message.guild.id)
+            return message.reply(
+                '❌ Le serveur de backup ne peut pas être le même que le serveur source !\n' +
+                'Vérifie la variable `SECOND_SERVER_ID` dans Render.'
+            );
+
         const src = message.guild;
+
+        // On mémorise la référence du salon SOURCE avant toute opération.
+        // status.edit() peut échouer si le canal est retiré du cache pendant
+        // des suppressions massives → safeEdit() bascule sur channel.send().
+        const replyChannel = message.channel;
+        let status = await message.reply('⏳ Backup en cours… (suppression puis reconstruction)');
+
+        /**
+         * Édite le message de statut de façon sécurisée.
+         * Si le canal n'est plus en cache (ChannelNotCached), envoie un
+         * nouveau message dans le salon source à la place.
+         */
+        const safeEdit = async (text) => {
+            try {
+                status = await status.edit(text);
+            } catch (e) {
+                console.warn('[BACKUP] safeEdit – edit raté, envoi nouveau message :', e.message);
+                try {
+                    status = await replyChannel.send(text);
+                } catch (e2) {
+                    console.error('[BACKUP] safeEdit – fallback aussi raté :', e2.message);
+                }
+            }
+        };
+
         let rolesOk = 0, chOk = 0, delOk = 0, errs = 0;
 
         try {
             // ────────────────────────────────────────────────
             // ÉTAPE 0 — Rafraîchissement des caches
-            // Indispensable si le bot vient de démarrer ou si
-            // les caches sont incomplets.
             // ────────────────────────────────────────────────
-            await status.edit('🔄 Rafraîchissement des caches…');
+            await safeEdit('🔄 Rafraîchissement des caches…');
             await dest.channels.fetch();
             await dest.roles.fetch();
             await src.channels.fetch();
             await src.roles.fetch();
 
             // ────────────────────────────────────────────────
-            // ÉTAPE 1 — Nettoyage complet du serveur de backup
-            // ⚠️  On snapshot les collections dans des tableaux
-            // AVANT de commencer les suppressions.
-            // Si on itère directement sur dest.channels.cache,
-            // les events channelDelete la modifient en live et
-            // l'itérateur plante silencieusement à mi-chemin.
+            // ÉTAPE 1 — Nettoyage du serveur de backup
+            // On snapshote les collections AVANT de supprimer
+            // pour éviter les bugs d'itérateur sur cache muté.
             // ────────────────────────────────────────────────
-            await status.edit('🗑️ Suppression des salons du serveur de backup…');
+            await safeEdit('🗑️ Suppression des salons du serveur de backup…');
 
-            // Snapshot → tableau figé, immunisé contre les mises à jour du cache
             const channelsToDelete = [...dest.channels.cache.values()];
             for (const ch of channelsToDelete) {
                 try { await ch.delete('Nettoyage avant backup'); delOk++; }
                 catch (e) { console.error('[BACKUP] del channel:', e.message); errs++; }
             }
 
-            await status.edit('🗑️ Suppression des rôles du serveur de backup…');
+            await safeEdit('🗑️ Suppression des rôles du serveur de backup…');
 
             const rolesToDelete = [...dest.roles.cache.values()]
                 .filter(r => r.id !== dest.id && !r.managed);
@@ -886,11 +904,9 @@ client.on('messageCreate', async (message) => {
             }
 
             // ────────────────────────────────────────────────
-            // ÉTAPE 2 — Copie des rôles du serveur principal
-            // On construit roleMap (ancienId → nouvelId) pour
-            // mapper les permissions des salons ensuite.
+            // ÉTAPE 2 — Copie des rôles
             // ────────────────────────────────────────────────
-            await status.edit('👑 Copie des rôles en cours…');
+            await safeEdit('👑 Copie des rôles en cours…');
 
             const roleMap = new Map();
             roleMap.set(src.roles.everyone.id, dest.roles.everyone.id);
@@ -914,13 +930,7 @@ client.on('messageCreate', async (message) => {
                 } catch (e) { console.error('[BACKUP] create role:', e.message); errs++; }
             }
 
-            // ────────────────────────────────────────────────
-            // Helper : mappe les permissionOverwrites source
-            // vers les IDs du serveur dest via roleMap.
-            //  • Rôle   → remplacé par le nouvel ID
-            //  • Membre → userId conservé (même sur les 2 serveurs)
-            //  • Rôle introuvable dans roleMap → ignoré (orphelin)
-            // ────────────────────────────────────────────────
+            // Helper : mappe les permissionOverwrites source → IDs du serveur dest
             function mapOverwrites(channel) {
                 return channel.permissionOverwrites.cache
                     .map(po => {
@@ -936,7 +946,7 @@ client.on('messageCreate', async (message) => {
             // ────────────────────────────────────────────────
             // ÉTAPE 3 — Copie des catégories
             // ────────────────────────────────────────────────
-            await status.edit('📁 Copie des catégories en cours…');
+            await safeEdit('📁 Copie des catégories en cours…');
 
             const catMap = new Map();
             const cats = [...src.channels.cache.values()]
@@ -960,7 +970,7 @@ client.on('messageCreate', async (message) => {
             // ────────────────────────────────────────────────
             // ÉTAPE 4 — Copie des salons (texte, vocal, etc.)
             // ────────────────────────────────────────────────
-            await status.edit('💬 Copie des salons en cours…');
+            await safeEdit('💬 Copie des salons en cours…');
 
             const channels = [...src.channels.cache.values()]
                 .filter(c => c.type !== ChannelType.GuildCategory)
@@ -987,7 +997,7 @@ client.on('messageCreate', async (message) => {
                 } catch (e) { console.error('[BACKUP] create channel:', e.message); errs++; }
             }
 
-            await status.edit(
+            await safeEdit(
                 `✅ Backup terminé sur **${dest.name}** !\n` +
                 `🗑️ **${delOk}** salon(s) supprimé(s) · ` +
                 `👑 **${rolesOk}** rôle(s) · ` +
@@ -997,7 +1007,8 @@ client.on('messageCreate', async (message) => {
 
         } catch (err) {
             console.error('[BACKUP]', err);
-            await status.edit('❌ Erreur critique lors du backup. Vérifie les permissions du bot sur le serveur cible.');
+            // safeEdit ici aussi pour éviter un second crash si le canal est mort
+            await safeEdit('❌ Erreur critique lors du backup. Vérifie les permissions du bot sur le serveur cible.');
         }
     }
 
