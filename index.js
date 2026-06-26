@@ -1307,6 +1307,42 @@ client.on('messageCreate', async (message) => {
 
         await message.channel.send({ embeds: [panelEmbed], components: [panelRow] });
 
+        // ── Log persistant du panneau dans LOG.tickets ────
+        // Permet la restauration de ticketConfigs au redémarrage du bot.
+        // Sans ça, les boutons des panneaux déjà postés deviennent inertes.
+        try {
+            const trackCh = message.guild.channels.cache.get(LOG.tickets);
+            if (trackCh?.isTextBased()) {
+                const jsonPayload = JSON.stringify({
+                    type         : 'panel',
+                    configId,
+                    categoryId,
+                    logsId,
+                    salonText,
+                    beforeSalonId,
+                    titleText    : title,
+                    mainText,
+                }, null, 2);
+
+                await trackCh.send({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(0x5865F2)
+                            .setTitle('📋 Panneau de tickets — config sauvegardée')
+                            .setDescription(`\`\`\`json\n${jsonPayload}\n\`\`\``)
+                            .addFields(
+                                { name: 'Salon panneau', value: `<#${message.channel.id}>`, inline: true },
+                                { name: 'Catégorie',     value: `<#${categoryId}>`,          inline: true },
+                                { name: 'Config ID',     value: `\`${configId}\``,           inline: false },
+                            )
+                            .setTimestamp(),
+                    ],
+                });
+            }
+        } catch (e) {
+            console.error('[TICKET] panel log :', e.message);
+        }
+
         // Supprime la commande pour garder le salon propre
         await message.delete().catch(() => {});
 
@@ -1481,6 +1517,7 @@ client.on('interactionCreate', async (interaction) => {
                 guildId    : guild.id,
                 configId,
                 embedMsgId : null,  // renseigné juste après
+                logMsgId   : null,  // ID du message dans LOG.tickets (persistance redémarrage)
             });
 
             // ── Embed intérieur du ticket ──────────────────
@@ -1505,6 +1542,51 @@ client.on('interactionCreate', async (interaction) => {
 
             // ── Mémorise l'ID du message embed ────────────
             ticketSessions.get(ticketChannel.id).embedMsgId = embedMsg.id;
+
+            // ── Log persistant du ticket dans LOG.tickets ─
+            // Permet la restauration complète de ticketSessions au redémarrage.
+            // Le JSON embarqué contient tout ce qu'il faut pour reconstruire
+            // la session ET la config sans aucune autre source.
+            try {
+                const ticketLogCh = guild.channels.cache.get(LOG.tickets);
+                if (ticketLogCh?.isTextBased()) {
+                    const jsonPayload = JSON.stringify({
+                        type         : 'ticket',
+                        channelId    : ticketChannel.id,
+                        openerId     : user.id,
+                        claimedBy    : null,
+                        guildId      : guild.id,
+                        configId,
+                        embedMsgId   : embedMsg.id,
+                        // Copie de la config pour restauration si ticketConfigs est vide
+                        categoryId   : config.categoryId,
+                        logsId       : config.logsId,
+                        salonText    : config.salonText,
+                        beforeSalonId: config.beforeSalonId,
+                        titleText    : config.titleText,
+                        mainText     : config.mainText,
+                    }, null, 2);
+
+                    const logMsg = await ticketLogCh.send({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setColor(0x57F287)
+                                .setTitle('🎫 Ticket ouvert — suivi actif')
+                                .setDescription(`\`\`\`json\n${jsonPayload}\n\`\`\``)
+                                .addFields(
+                                    { name: '👤 Ouvert par', value: `${user.tag} \`(${user.id})\``, inline: true },
+                                    { name: '🎫 Salon',      value: `<#${ticketChannel.id}>`,         inline: true },
+                                    { name: '📌 Statut',     value: '🟢 Ouvert',                       inline: true },
+                                )
+                                .setTimestamp(),
+                        ],
+                    });
+
+                    ticketSessions.get(ticketChannel.id).logMsgId = logMsg.id;
+                }
+            } catch (e) {
+                console.error('[TICKET] open log :', e.message);
+            }
 
             // ── Réponse éphémère à l'utilisateur ──────────
             await interaction.editReply({
@@ -1551,6 +1633,37 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         session.claimedBy = user.id;
+
+        // ── Mise à jour du log persistant dans LOG.tickets ─
+        // On parse le JSON existant, on met à jour claimedBy, on ré-envoie.
+        if (session.logMsgId) {
+            try {
+                const ticketLogCh = guild.channels.cache.get(LOG.tickets);
+                if (ticketLogCh?.isTextBased()) {
+                    const logMsg    = await ticketLogCh.messages.fetch(session.logMsgId);
+                    const jsonMatch = logMsg.embeds[0]?.description?.match(/```json\n([\s\S]+?)\n```/);
+                    if (jsonMatch) {
+                        const data     = JSON.parse(jsonMatch[1]);
+                        data.claimedBy = user.id;
+                        const newJson  = JSON.stringify(data, null, 2);
+                        await logMsg.edit({
+                            embeds: [
+                                EmbedBuilder.from(logMsg.embeds[0])
+                                    .setColor(0xFEE75C)
+                                    .setDescription(`\`\`\`json\n${newJson}\n\`\`\``)
+                                    .spliceFields(2, 1, {
+                                        name  : '📌 Statut',
+                                        value : `🟡 Pris en charge par ${user.tag}`,
+                                        inline: true,
+                                    }),
+                            ],
+                        });
+                    }
+                }
+            } catch (e) {
+                console.error('[TICKET] claim log update :', e.message);
+            }
+        }
 
         // ── Ajoute les permissions du claimer au salon ─────
         await channel.permissionOverwrites.edit(user.id, {
@@ -1736,6 +1849,19 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             // ── Nettoyage + suppression du salon ──────────
+            // Supprime le log persistant dans LOG.tickets en premier
+            if (session.logMsgId) {
+                try {
+                    const ticketLogCh = guild.channels.cache.get(LOG.tickets);
+                    if (ticketLogCh?.isTextBased()) {
+                        const logMsg = await ticketLogCh.messages.fetch(session.logMsgId).catch(() => null);
+                        if (logMsg) await logMsg.delete();
+                    }
+                } catch (e) {
+                    console.error('[TICKET] close log delete :', e.message);
+                }
+            }
+
             ticketSessions.delete(channel.id);
             await channel.delete(`Ticket fermé par ${user.tag}`);
 
