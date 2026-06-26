@@ -169,22 +169,46 @@ function isExempt(user) {
 
 /**
  * Parse les paramètres de la commande +CreateTicket.
- * Supporte Key:(valeur avec espaces) et Key:valeurSimple.
+ *
+ * Formats acceptés (par ordre de priorité) :
+ *   Key:[valeur avec espaces et (caractères) spéciaux]  ← recommandé
+ *   Key:(valeur avec espaces)                            ← rétrocompat
+ *   Key:motSimple                                        ← sans espace seulement
+ *
+ * Exemple :
+ *   +CreateTicket Tittle:[Support] Text:[Ouvre un ticket !]
+ *                 AimedCategory:123 Logs:456 SalonText:[Décris ton problème.]
+ *                 BeforeSalonID:support_
  */
 function parseTicketArgs(content) {
     const params = {};
-    // Paramètres avec parenthèses : Key:(valeur) — supporte espaces et caractères spéciaux
-    const parenRegex = /(\w+):\(([^)]+)\)/gi;
+
+    // ── Priorité 1 : Key:[valeur avec espaces] ────────────
+    // Crochets : tout ce qui est entre [ et ] est capturé tel quel.
+    // C'est le format recommandé car il supporte aussi les parenthèses en valeur.
+    const bracketRegex = /(\w+):\[([^\]]+)\]/gi;
     let m;
-    while ((m = parenRegex.exec(content)) !== null) {
+    while ((m = bracketRegex.exec(content)) !== null) {
         params[m[1].toLowerCase()] = m[2].trim();
     }
-    // Paramètres sans parenthèses : Key:valeur — jusqu'au prochain espace
-    const simpleRegex = /(\w+):([^\s(][^\s]*)/gi;
+
+    // ── Priorité 2 : Key:(valeur avec espaces) ──────────
+    // Parenthèses : rétrocompatibilité avec l'ancienne syntaxe.
+    const parenRegex = /(\w+):\(([^)]+)\)/gi;
+    while ((m = parenRegex.exec(content)) !== null) {
+        const key = m[1].toLowerCase();
+        if (!params[key]) params[key] = m[2].trim();
+    }
+
+    // ── Priorité 3 : Key:valeurSansEspace ─────────────
+    // Capture les valeurs simples (IDs, préfixes) sans délimiteur.
+    // Ne capture pas les valeurs commençant par [ ou ( pour éviter les doublons.
+    const simpleRegex = /(\w+):([^\s\[(]\S*)/gi;
     while ((m = simpleRegex.exec(content)) !== null) {
         const key = m[1].toLowerCase();
         if (!params[key]) params[key] = m[2].trim();
     }
+
     return params;
 }
 
@@ -1264,7 +1288,7 @@ client.on('messageCreate', async (message) => {
         if (missing.length > 0) {
             return message.reply(
                 `❌ Paramètre(s) manquant(s) : ${missing.join(', ')}\n\n` +
-                `**Usage :** \`+CreateTicket Tittle:(titre) Text:(texte) AimedCategory:<ID> Logs:<ID> SalonText:(texte) BeforeSalonID:<préfixe>\``
+                `**Usage :** \`+CreateTicket Tittle:[titre] Text:[texte] AimedCategory:<ID> Logs:<ID> SalonText:[texte] BeforeSalonID:<préfixe>\``
             );
         }
 
@@ -1382,14 +1406,14 @@ client.on('messageCreate', async (message) => {
                 {
                     name  : '🎫 Système de tickets',
                     value : [
-                        '`+CreateTicket Tittle:(…) Text:(…) AimedCategory:<ID> Logs:<ID> SalonText:(…) BeforeSalonID:<préfixe>`',
+                        '`+CreateTicket Tittle:[…] Text:[…] AimedCategory:<ID> Logs:<ID> SalonText:[…] BeforeSalonID:<préfixe>`',
                         '> Crée un panneau d\'ouverture de tickets dans le salon courant.',
                         '> **Tittle** — Titre de l\'embed du panneau',
                         '> **Text** — Description de l\'embed du panneau',
                         '> **AimedCategory** — ID de la catégorie où créer les tickets',
                         '> **Logs** — ID du salon où envoyer les transcripts à la fermeture',
                         '> **SalonText** — Texte de l\'embed affiché à l\'intérieur du ticket',
-                        '> **BeforeSalonID** — Préfixe du nom du salon (ex: `ticket` → `ticket_123456789`)',
+                        '> **BeforeSalonID** — Préfixe du nom du salon, sans crochets (ex: `recrutement_` → `recrutement_123456789`)',
                         '',
                         'Boutons disponibles **dans chaque ticket** :',
                         '> 🙋 **Prendre en charge** — Assigne le ticket à un modérateur',
